@@ -59,8 +59,11 @@ Good to know:
 | **When you log a distraction** | *Neutral*: the dot blinks faintly. *Subtle negative cue*: the widget flashes dull red. *Audible negative cue*: a short, low buzz (volume adjustable). *Flash and buzz*: both. |
 | **Floating widget shows** | *Just the dot*, *dot and minutes left*, or *dot, minutes left and count*. Time is shown in whole minutes, so nothing ticks. |
 | **Size / opacity** | Small, medium or large, and how see-through it is. *Show preview* displays the widget so you can position it and test your feedback setting. |
+| **Dot colour** | *Match system*, *Light* or *Dark*. The dot is least noticeable when it blends with the page you're reading. |
+| **Appearance** | *Match system* follows the light/dark setting of Windows or Zorin and switches as soon as you change it. You can also force *Light* or *Dark*. |
 | **Keyboard shortcut** | On or off. Type a shortcut (e.g. `Ctrl+Alt+D`, `F8`) and press *Save*, or press *Record…* and then the keys. |
-| **Session history folder** | Where sessions are saved (see below). |
+| **Session history and CSV files** | Where sessions are saved (see below), and whether up-to-date CSV copies are kept there. |
+| **Updates** | Whether to check GitHub for a newer version when the app starts, plus a *Check now* button. |
 
 ---
 
@@ -97,8 +100,68 @@ Preferences such as the shortcut and widget position stay separate on each compu
 - If one session is off the scale, it's drawn as a ▲ at the top edge. Hover over any dot
   or bar to see its exact numbers.
 
-The **History** tab lists every session. You can delete sessions there or export them all
-to CSV.
+The **History** tab lists every session. You can delete sessions there or export them to CSV.
+
+---
+
+## Exporting your data (CSV)
+
+Every session records a full log: when it started and ended, each distraction press (and
+whether it came from a click, the keyboard shortcut or the `--log` command), every pause and
+resume with real times, any undo, and how the session ended.
+
+**History → Export CSV…** asks for a folder and saves two files. If you select sessions in
+the list first, only those are exported; otherwise everything is.
+
+- **`focus-trainer-sessions.csv`**: one row per session. Columns include `date`,
+  `start_time`, `weekday`, `time_of_day`, `planned_minutes`, `active_minutes`,
+  `paused_minutes`, `pause_count`, `completed`, `end_reason`, `distractions`,
+  `distractions_per_10_min`, `longest_focus_seconds`, `average_focus_seconds`,
+  `first_distraction_seconds`, `by_click`, `by_hotkey`, `by_command`, `undone_presses`,
+  `computer`, and the feedback and widget settings used.
+- **`focus-trainer-events.csv`**: one row per event (`session_start`, `distraction`,
+  `undo`, `pause`, `auto_pause` (the computer slept), `resume`, `session_end`), with
+  its date, time, `seconds_into_session` (reading time, excluding pauses), `source`,
+  `counted` (FALSE for presses you undid), `seconds_since_previous` (the focus stretch
+  before each distraction), and `paused_seconds` on resumes.
+
+**Automatic copies:** with *Keep up-to-date CSV files* switched on (Settings), the same two
+files are kept as `sessions.csv` and `events.csv` in the `csv` folder inside your history
+folder. They're refreshed after every session, so you can point Excel, Python or R straight
+at them. If a file is open in Excel when a session ends, it's updated after your next session.
+
+Sessions recorded with version 1.0 have only the press times. Their events are rebuilt from
+those, and the source columns are left blank.
+
+---
+
+## Updates
+
+When the app starts, it checks the `main` branch of
+[markmcmanus03/FOCUS](https://github.com/markmcmanus03/FOCUS) for a newer version. If it
+finds one, it shows what's new and asks before installing. It never interrupts a session;
+the offer waits until the session ends. *Settings → Updates* has a **Check now** button
+and lets you turn off the automatic check.
+
+When you choose **Install and restart**, the app:
+1. downloads the new files and checks each one against the checksum published with the
+   release, so nothing changes if a download is incomplete or altered
+2. makes sure the new program has no errors before using it
+3. copies your current version into a `.backup` folder inside the app folder (the
+   three most recent backups are kept)
+4. replaces the files and restarts.
+
+Your sessions and settings live elsewhere and aren't touched. If the app folder is a Git
+clone, the updater runs `git pull` instead.
+
+To go back to an earlier version, copy the files from the newest folder in `.backup` over
+the ones in the app folder.
+
+Notes:
+- The repository must be **public** for the updater to download from it. If it's private,
+  the app says so when it checks.
+- Copies of version 1.0 don't include the updater. Download the app once more to get it;
+  after that, updates are automatic.
 
 ---
 
@@ -127,7 +190,9 @@ to any button or shortcut tool.
 | What | Windows | Zorin / Linux |
 |---|---|---|
 | Sessions (default) | `Documents\Focus Trainer\sessions\` | `~/Documents/Focus Trainer/sessions/` |
+| CSV copies | `Documents\Focus Trainer\csv\` | `~/Documents/Focus Trainer/csv/` |
 | Settings, sounds, error log | `%APPDATA%\FocusTrainer\` | `~/.config/focus-trainer/` |
+| Previous versions (after updating) | `.backup\` in the app folder | `.backup/` in the app folder |
 
 Each session file records the start time, the planned and actual length, and the time of
 every press. Nothing leaves your computer except through a sync folder you choose.

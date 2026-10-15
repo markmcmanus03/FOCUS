@@ -1,0 +1,20 @@
+{
+  "version": "1.1.0",
+  "released": "2026-10-15",
+  "notes": [
+    "Every session now records a full event log: each press (and whether it was a click, the shortcut or the --log command), pauses with their real times, undos and how the session ended.",
+    "Export CSV on the History tab saves a sessions file and an events file, for all sessions or just the ones you select.",
+    "CSV copies of all sessions are kept up to date automatically in the csv folder inside your history folder.",
+    "Dark theme that follows your system's light/dark setting, with a Light/Dark override in Settings.",
+    "The floating dot has its own colour setting: Match system, Light or Dark.",
+    "Built-in updater: checks GitHub at startup and asks before installing a newer version."
+  ],
+  "files": {
+    "focus_trainer.py": "e10219e8d6dd575b7e28b33c3f1ba8d8014d9abfeff2ab6e417b723d53ffe41e",
+    "README.md": "f50b4f354f4de59b3a42a350d0c1be9cc0aa13eb2386cc726ed45eef405894fc",
+    "install_zorin.sh": "64904d8012413136b195cd7709b12defeb770389994634ead47cf16c1a3cdb80",
+    "Start Focus Trainer.bat": "f5e5eceecba91f88804358d39ff51a0afb44c0d50426b3d02bcbd67d18473606",
+    "setup_windows.bat": "d96f200a7233133ce7dd38dcae8912172b7a9620dfea93e91e8698ba9f2fdf8c",
+    "icon.png": "99acf06ce6a8668baef84aa4d256b7901cbade781dfbf2a000dab2a2c70cfbf5"
+  }
+}
