@@ -20,11 +20,14 @@ from __future__ import annotations
 import array
 import csv
 import glob
+import hashlib
+import io
 import json
 import math
 import os
 import platform
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -32,6 +35,9 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 import wave
 from datetime import datetime, timedelta
@@ -49,43 +55,57 @@ except ImportError:  # pragma: no cover - depends on the system
     sys.exit(1)
 
 APP_NAME = "Focus Trainer"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1.0"
 IPC_HOST, IPC_PORT = "127.0.0.1", 47821
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Updates come from version.json on the main branch of the GitHub repository
+UPDATE_REPO = "markmcmanus03/FOCUS"
+UPDATE_BRANCH = "main"
+UPDATE_BASE_URL = (os.environ.get("FOCUS_TRAINER_UPDATE_URL")
+                   or f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}/")
 
 DEBOUNCE_SECONDS = 1.0        # presses closer together than this count once
 SHORT_SESSION_SECONDS = 120   # ask before saving sessions shorter than this
 ROLLING_WINDOW = 7            # sessions in the moving average
 SUSPEND_GAP_SECONDS = 20      # a tick gap this long means the computer slept
 
-# Interface colours
-PAGE = "#f9f9f7"
-SURFACE = "#fcfcfb"
-INK = "#0b0b0b"
-INK_2 = "#52514e"
-MUTED = "#898781"
-GRID = "#e1e0d9"
-AXIS = "#c3c2b7"
-BORDER = "#e4e3dd"
-HOVER = "#f0efec"
-ACCENT = "#2a78d6"
-ACCENT_HOVER = "#256abf"
-ACCENT_DARK = "#1c5cab"
-ACCENT_LIGHT = "#86b6ef"
-ACCENT_WASH = "#cde2fb"
-GOOD = "#006300"
-BAD = "#d03b3b"
-TIP_BG = "#1a1a19"
-TIP_FG = "#f0efec"
+# Colour tokens. `C` holds the active theme and is updated in place when it changes,
+# so code always reads colours at draw time (C.page, C.ink, ...).
+LIGHT = dict(
+    page="#f9f9f7", surface="#fcfcfb", field="#fcfcfb", stripe="#f6f5f2",
+    ink="#0b0b0b", ink2="#52514e", muted="#898781",
+    grid="#e1e0d9", axis="#c3c2b7", border="#e4e3dd", hover="#f0efec",
+    accent="#2a78d6", accent_hover="#256abf", accent_press="#1c5cab", on_accent="#ffffff",
+    focus="#86b6ef", select="#cde2fb",
+    series="#2a78d6", series_soft="#86b6ef", series_strong="#1c5cab",
+    good="#006300", bad="#d03b3b", tip_bg="#1a1a19", tip_fg="#f0efec",
+)
+DARK = dict(
+    page="#121211", surface="#1a1a19", field="#1f1f1e", stripe="#161615",
+    ink="#f0efec", ink2="#c3c2b7", muted="#8f8d86",
+    grid="#2c2c2a", axis="#45443f", border="#2f2f2c", hover="#262624",
+    accent="#2a78d6", accent_hover="#3987e5", accent_press="#1c5cab", on_accent="#ffffff",
+    focus="#3987e5", select="#1d3554",
+    series="#5598e7", series_soft="#245a9e", series_strong="#86b6ef",
+    good="#0ca30c", bad="#e66767", tip_bg="#f0efec", tip_fg="#0b0b0b",
+)
 
-# Floating widget colours: dark, low-contrast, so it sits quietly on any page
-W_BODY = "#2a2a28"
-W_DOT = "#77766f"
-W_DOT_BLINK = "#d6d5ce"
-W_TEXT = "#a3a29a"
-W_RED_BODY = "#5e2222"
-W_RED_DOT = "#c44a4a"
+
+class _Colors:
+    def __init__(self, values):
+        self.__dict__.update(values)
+
+
+C = _Colors(LIGHT)
+
+# Floating widget colours: low contrast, so it sits quietly on the page you're reading
+DOT_DARK = dict(body="#2a2a28", dot="#77766f", blink="#d6d5ce", text="#a3a29a",
+                red_body="#5e2222", red_dot="#c44a4a")
+DOT_LIGHT = dict(body="#ecebe6", dot="#a8a7a0", blink="#4a4945", text="#6b6a64",
+                 red_body="#f2d4d4", red_dot="#c44a4a")
 
 FEEDBACK_MODES = [
     ("neutral", "Neutral", "The dot blinks faintly so you know the press counted."),
@@ -108,6 +128,8 @@ TIME_BUCKETS = [  # (name, hours label, first hour, end hour, phrase)
     ("Night", "21–5", 21, 5, "at night"),
 ]
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+THEME_CHOICES = [("system", "Match system"), ("light", "Light"), ("dark", "Dark")]
 
 DEFAULT_SETTINGS = {
     "data_folder": "",
@@ -123,6 +145,12 @@ DEFAULT_SETTINGS = {
     "minimize_on_start": True,
     "hotkey_enabled": True,
     "hotkey": "Ctrl+Alt+D",
+    "appearance": "system",
+    "dot_theme": "system",
+    "auto_csv": True,
+    "check_updates": True,
+    "skipped_version": "",
+    "updated_from": "",
 }
 
 
@@ -376,19 +404,316 @@ def weighted_rate(recs):
 def change_text(new, old, label, lower_is_better=True):
     """('↓ 18% vs previous 30 days · better', colour) for a delta line."""
     if new is None or old is None:
-        return f"No sessions in {label} to compare with", MUTED
+        return f"No sessions in {label} to compare with", C.muted
     if old == 0:
         if new == 0:
-            return f"→ Same as {label}", INK_2
+            return f"→ Same as {label}", C.ink2
         better = not lower_is_better
-        return f"↑ Up from 0 in {label} · {'better' if better else 'worse'}", GOOD if better else BAD
+        return f"↑ Up from 0 in {label} · {'better' if better else 'worse'}", C.good if better else C.bad
     pct = (new - old) / old * 100
     if abs(pct) < 5:
-        return f"→ About the same as {label}", INK_2
+        return f"→ About the same as {label}", C.ink2
     better = (pct < 0) == lower_is_better
     arrow = "↓" if pct < 0 else "↑"
     amount = f"{new / old:.1f}×" if pct >= 100 else f"{abs(pct):.0f}%"
-    return f"{arrow} {amount} vs {label} · {'better' if better else 'worse'}", GOOD if better else BAD
+    return f"{arrow} {amount} vs {label} · {'better' if better else 'worse'}", C.good if better else C.bad
+
+
+def time_bucket(hour):
+    """Index into TIME_BUCKETS for an hour of the day."""
+    for i, (_, _, a, b, _) in enumerate(TIME_BUCKETS):
+        if (a <= hour < b) if a < b else (hour >= a or hour < b):
+            return i
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CSV export: one row per session, and one row per event
+# ---------------------------------------------------------------------------
+
+SESSION_COLUMNS = [
+    "session_id", "date", "start_time", "weekday", "time_of_day", "start", "end",
+    "planned_minutes", "active_minutes", "paused_minutes", "pause_count", "completed", "end_reason",
+    "distractions", "distractions_per_10_min", "longest_focus_seconds", "longest_focus_from_seconds",
+    "average_focus_seconds", "first_distraction_seconds", "by_click", "by_hotkey", "by_command",
+    "undone_presses", "computer", "platform", "feedback", "widget_display", "app_version",
+]
+EVENT_COLUMNS = [
+    "session_id", "session_start", "event_number", "event", "date", "time", "timestamp",
+    "seconds_into_session", "minutes_into_session", "source", "counted", "seconds_since_previous",
+    "paused_seconds", "detail",
+]
+EVENT_NAMES = {"start": "session_start", "end": "session_end", "distraction": "distraction", "undo": "undo",
+               "pause": "pause", "auto_pause": "auto_pause", "resume": "resume"}
+SOURCE_NAMES = {"click": "click", "hotkey": "hotkey", "ipc": "command", "command": "command"}
+END_REASONS = {"completed": "timer finished", "ended_early": "ended early", "quit": "app closed during the session",
+               "recovered": "recovered after the app closed unexpectedly", "unfinished": "session still running"}
+
+
+def _yes(flag):
+    return "TRUE" if flag else "FALSE"
+
+
+def session_events(rec):
+    """The session's event list, rebuilt from press times for files saved by version 1.0."""
+    if rec.get("events"):
+        return rec["events"], False
+    start = rec["_start"]
+    completed = rec.get("completed", False)
+    events = [{"type": "start", "at": rec["start"], "t": 0.0}]
+    for t in sorted(rec.get("distractions", [])):
+        events.append({"type": "distraction", "t": t,
+                       "at": (start + timedelta(seconds=t)).isoformat(timespec="seconds")})
+    end_at = rec.get("end") or (start + timedelta(seconds=rec["active_seconds"])).isoformat(timespec="seconds")
+    events.append({"type": "end", "at": end_at, "t": rec["active_seconds"],
+                   "reason": "completed" if completed else "ended_early"})
+    return events, True
+
+
+def session_row(rec):
+    m = rec["_m"]
+    start = rec["_start"]
+    events, rebuilt = session_events(rec)
+    presses = [e for e in events if e["type"] == "distraction" and not e.get("undone")]
+    by_source = {name: sum(1 for e in presses if SOURCE_NAMES.get(e.get("source")) == name)
+                 for name in ("click", "hotkey", "command")}
+    completed = rec.get("completed", False)
+    return {
+        "session_id": rec["id"],
+        "date": start.strftime("%Y-%m-%d"),
+        "start_time": start.strftime("%H:%M:%S"),
+        "weekday": DAY_NAMES[start.weekday()],
+        "time_of_day": TIME_BUCKETS[time_bucket(start.hour)][0],
+        "start": rec["start"],
+        "end": rec.get("end", ""),
+        "planned_minutes": round(rec.get("planned_seconds", m["seconds"]) / 60, 2),
+        "active_minutes": round(m["seconds"] / 60, 2),
+        "paused_minutes": round(rec["paused_seconds"] / 60, 2) if "paused_seconds" in rec else "",
+        "pause_count": rec.get("pause_count", 0),
+        "completed": _yes(completed),
+        "end_reason": rec.get("end_reason") or ("completed" if completed else "ended_early"),
+        "distractions": m["count"],
+        "distractions_per_10_min": round(m["rate"], 3),
+        "longest_focus_seconds": round(m["longest"], 1),
+        "longest_focus_from_seconds": round(m["longest_start"], 1),
+        "average_focus_seconds": round(m["seconds"] / (m["count"] + 1), 1),
+        "first_distraction_seconds": round(m["times"][0], 1) if m["times"] else "",
+        "by_click": "" if rebuilt else by_source["click"],
+        "by_hotkey": "" if rebuilt else by_source["hotkey"],
+        "by_command": "" if rebuilt else by_source["command"],
+        "undone_presses": "" if rebuilt else sum(1 for e in events if e["type"] == "undo"),
+        "computer": rec.get("machine", ""),
+        "platform": rec.get("platform", ""),
+        "feedback": rec.get("feedback", ""),
+        "widget_display": rec.get("display", ""),
+        "app_version": rec.get("app_version", "1.0"),
+    }
+
+
+def event_rows(rec):
+    events, rebuilt = session_events(rec)
+    previous = 0.0
+    for number, ev in enumerate(events, 1):
+        at = parse_iso(ev["at"])
+        kind = ev["type"]
+        t = float(ev.get("t", 0.0))
+        row = dict.fromkeys(EVENT_COLUMNS, "")
+        row.update({
+            "session_id": rec["id"], "session_start": rec["start"], "event_number": number,
+            "event": EVENT_NAMES.get(kind, kind), "date": at.strftime("%Y-%m-%d"),
+            "time": at.strftime("%H:%M:%S"), "timestamp": ev["at"],
+            "seconds_into_session": round(t, 1), "minutes_into_session": round(t / 60, 2),
+        })
+        detail = []
+        if kind == "distraction":
+            row["source"] = SOURCE_NAMES.get(ev.get("source"), "")
+            row["counted"] = _yes(not ev.get("undone"))
+            if not ev.get("undone"):
+                row["seconds_since_previous"] = round(t - previous, 1)
+                previous = t
+            else:
+                detail.append("undone")
+        elif kind == "undo":
+            detail.append(f"removed the press at {fmt_offset(ev.get('removed_t', t))}")
+        elif kind == "resume":
+            row["paused_seconds"] = ev.get("paused_seconds", "")
+        elif kind == "auto_pause":
+            detail.append("the computer went to sleep")
+        elif kind == "end":
+            detail.append(END_REASONS.get(ev.get("reason"), ev.get("reason", "")))
+        if rebuilt:
+            detail.append("rebuilt from a version 1.0 session file; times assume no pauses")
+        row["detail"] = "; ".join(d for d in detail if d)
+        yield row
+
+
+def write_csv(path, columns, rows, only_if_changed=False):
+    """Write rows as CSV. Returns False if the file already had exactly this content."""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    data = buf.getvalue().encode("utf-8")
+    if only_if_changed and os.path.exists(path):
+        with open(path, "rb") as f:
+            if f.read() == data:
+                return False
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return True
+
+
+def export_csvs(recs, folder, prefix="", only_if_changed=False):
+    """Write <prefix>sessions.csv and <prefix>events.csv; returns their paths."""
+    recs = sorted(recs, key=lambda r: r["_start"])
+    sessions_path = os.path.join(folder, f"{prefix}sessions.csv")
+    events_path = os.path.join(folder, f"{prefix}events.csv")
+    write_csv(sessions_path, SESSION_COLUMNS, (session_row(r) for r in recs), only_if_changed)
+    write_csv(events_path, EVENT_COLUMNS, (row for r in recs for row in event_rows(r)), only_if_changed)
+    return sessions_path, events_path
+
+
+# ---------------------------------------------------------------------------
+# System appearance (light / dark)
+# ---------------------------------------------------------------------------
+
+def detect_system_theme():
+    """'dark' or 'light', following the desktop's appearance setting."""
+    def run(*cmd):
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=2).stdout.strip().lower()
+    try:
+        if IS_WINDOWS:
+            import winreg
+            key = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+                return "light" if winreg.QueryValueEx(k, "AppsUseLightTheme")[0] else "dark"
+        if IS_MAC:
+            return "dark" if "dark" in run("defaults", "read", "-g", "AppleInterfaceStyle") else "light"
+        if shutil.which("gsettings"):  # GNOME, Zorin, Cinnamon, Budgie...
+            scheme = run("gsettings", "get", "org.gnome.desktop.interface", "color-scheme")
+            if "prefer-dark" in scheme:
+                return "dark"
+            if "prefer-light" in scheme:
+                return "light"
+            if "dark" in run("gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"):
+                return "dark"
+            return "light"
+    except Exception:
+        pass
+    return "dark" if "dark" in os.environ.get("GTK_THEME", "").lower() else "light"
+
+
+# ---------------------------------------------------------------------------
+# Updates from GitHub
+# ---------------------------------------------------------------------------
+
+class UpdateError(Exception):
+    pass
+
+
+SAFE_UPDATE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
+
+
+def version_tuple(text):
+    parts = [int(x) for x in re.findall(r"\d+", str(text))[:3]]
+    return tuple(parts + [0] * (3 - len(parts)))
+
+
+def http_get(url, timeout=20):
+    req = urllib.request.Request(url, headers={"User-Agent": f"FocusTrainer/{APP_VERSION}",
+                                               "Cache-Control": "no-cache"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise UpdateError("GitHub returned 'not found'. If the FOCUS repository is private, "
+                              "it needs to be public for updates to work.") from exc
+        raise UpdateError(f"GitHub returned an error ({exc.code}).") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise UpdateError(f"Couldn't reach GitHub ({getattr(exc, 'reason', exc)}).") from exc
+
+
+def fetch_manifest():
+    raw = http_get(f"{UPDATE_BASE_URL}version.json?t={int(time.time())}")
+    try:
+        man = json.loads(raw.decode("utf-8"))
+        assert isinstance(man["version"], str) and isinstance(man["files"], dict)
+        for name, digest in man["files"].items():
+            assert SAFE_UPDATE_NAME.match(name) and re.fullmatch(r"[0-9a-fA-F]{64}", digest)
+        man["notes"] = [str(n) for n in man.get("notes", [])]
+    except (ValueError, KeyError, AssertionError, TypeError, AttributeError) as exc:
+        raise UpdateError("The update information on GitHub couldn't be read.") from exc
+    return man
+
+
+def is_git_checkout(app_dir=APP_DIR):
+    return os.path.isdir(os.path.join(app_dir, ".git"))
+
+
+def install_update(man, app_dir=APP_DIR):
+    """Install the version described by `man`. Returns the backup folder (None for a git pull)."""
+    if is_git_checkout(app_dir):
+        git = shutil.which("git")
+        if not git:
+            raise UpdateError("This copy is a Git clone, but Git isn't installed. Run 'git pull' in the app folder.")
+        result = subprocess.run([git, "-C", app_dir, "pull", "--ff-only"], capture_output=True, text=True, timeout=180)
+        if result.returncode != 0:
+            raise UpdateError("'git pull' didn't work:\n" + (result.stderr or result.stdout).strip()[-600:])
+        return None
+
+    # 1. download everything and check it before touching any file
+    blobs = {}
+    for name, digest in man["files"].items():
+        data = http_get(UPDATE_BASE_URL + urllib.parse.quote(name))
+        if hashlib.sha256(data).hexdigest() != digest.lower():
+            raise UpdateError(f"{name} didn't match its checksum, so nothing was changed. Please try again later.")
+        blobs[name] = data
+    if "focus_trainer.py" not in blobs:
+        raise UpdateError("The update doesn't include the app itself.")
+    try:
+        compile(blobs["focus_trainer.py"], "focus_trainer.py", "exec")
+    except SyntaxError as exc:
+        raise UpdateError(f"The new version contains an error ({exc}), so it wasn't installed.") from exc
+
+    # 2. back up the current files
+    backups = os.path.join(app_dir, ".backup")
+    backup = os.path.join(backups, f"{APP_VERSION}_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    os.makedirs(backup, exist_ok=True)
+    for name in blobs:
+        if os.path.exists(os.path.join(app_dir, name)):
+            shutil.copy2(os.path.join(app_dir, name), os.path.join(backup, name))
+
+    # 3. replace the files; if anything fails, put the old ones back
+    written = []
+    try:
+        for name, data in blobs.items():
+            dest = os.path.join(app_dir, name)
+            tmp = dest + ".update-tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            if not IS_WINDOWS:
+                if os.path.exists(dest):
+                    mode = os.stat(dest).st_mode & 0o777
+                else:
+                    mode = 0o755 if name.endswith((".py", ".sh")) else 0o644
+                os.chmod(tmp, mode)
+            os.replace(tmp, dest)
+            written.append(name)
+    except OSError as exc:
+        for name in written:
+            old = os.path.join(backup, name)
+            if os.path.exists(old):
+                shutil.copy2(old, os.path.join(app_dir, name))
+        raise UpdateError(f"Couldn't write the new files ({exc}). Your current version was left in place.") from exc
+
+    # keep the three most recent backups
+    for old in sorted(glob.glob(os.path.join(backups, "*")), key=os.path.getmtime)[:-3]:
+        shutil.rmtree(old, ignore_errors=True)
+    return backup
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +721,8 @@ def change_text(new, old, label, lower_is_better=True):
 # ---------------------------------------------------------------------------
 
 class ActiveSession:
+    """A running session. Times called `t` are seconds of active (unpaused) reading."""
+
     def __init__(self, planned_seconds):
         self.id = uuid.uuid4().hex
         self.start = now_local()
@@ -406,8 +733,11 @@ class ActiveSession:
         self.paused = False
         self.auto_paused = False
         self.pause_count = 0
+        self.paused_seconds = 0.0
+        self.pause_wall_start = None
         self.distractions = []
         self.last_log = -1e9
+        self.events = [{"type": "start", "at": self.start.isoformat(timespec="seconds"), "t": 0.0}]
 
     def elapsed(self):
         if self.paused:
@@ -417,17 +747,33 @@ class ActiveSession:
     def remaining(self):
         return max(0.0, self.planned - self.elapsed())
 
+    def _event(self, kind, t=None, at=None, **extra):
+        ev = {"type": kind, "at": (at or now_local()).isoformat(timespec="seconds"),
+              "t": round(self.elapsed() if t is None else t, 1)}
+        ev.update(extra)
+        self.events.append(ev)
+        return ev
+
+    def _begin_pause(self, kind, at=None):
+        self.paused = True
+        self.pause_count += 1
+        self.pause_wall_start = (at or now_local()).timestamp()
+        self._event(kind, t=self.accum, at=at)
+
     def pause(self):
         if not self.paused:
             self.accum = self.elapsed()
-            self.paused = True
-            self.pause_count += 1
+            self._begin_pause("pause")
 
     def resume(self):
         if self.paused:
+            paused_for = max(0.0, time.time() - (self.pause_wall_start or time.time()))
+            self.paused_seconds += paused_for
+            self.pause_wall_start = None
             self.run_started = time.monotonic()
             self.paused = False
             self.auto_paused = False
+            self._event("resume", paused_seconds=round(paused_for))
 
     def check_suspend(self):
         """If the computer slept, don't count that time and pause the session."""
@@ -436,13 +782,12 @@ class ActiveSession:
         self.last_tick = now
         if gap > SUSPEND_GAP_SECONDS and not self.paused:
             self.accum = max(0.0, self.elapsed() - gap)
-            self.paused = True
             self.auto_paused = True
-            self.pause_count += 1
+            self._begin_pause("auto_pause", at=now_local() - timedelta(seconds=gap))
             return True
         return False
 
-    def log(self):
+    def log(self, source="click"):
         if self.paused:
             return False
         t = self.elapsed()
@@ -450,27 +795,44 @@ class ActiveSession:
             return False
         self.last_log = t
         self.distractions.append(round(t, 1))
+        self._event("distraction", t=t, source=source)
         return True
 
     def undo(self):
-        if self.distractions:
-            self.distractions.pop()
-            self.last_log = -1e9
-            return True
-        return False
+        if not self.distractions:
+            return False
+        removed = self.distractions.pop()
+        self.last_log = -1e9
+        for ev in reversed(self.events):
+            if ev["type"] == "distraction" and not ev.get("undone"):
+                ev["undone"] = True
+                break
+        self._event("undo", removed_t=removed)
+        return True
 
-    def to_record(self, completed, extra=None):
+    def to_record(self, completed, end_reason, extra=None):
         active = min(self.elapsed(), self.planned)
+        paused = self.paused_seconds
+        if self.paused and self.pause_wall_start:
+            paused += max(0.0, time.time() - self.pause_wall_start)
+        end = now_local()
+        events = [dict(ev) for ev in self.events]
+        events.append({"type": "end", "at": end.isoformat(timespec="seconds"), "t": round(active, 1),
+                       "reason": end_reason})
         rec = {
-            "format": 1,
+            "format": 2,
+            "app_version": APP_VERSION,
             "id": self.id,
             "start": self.start.isoformat(timespec="seconds"),
-            "end": now_local().isoformat(timespec="seconds"),
+            "end": end.isoformat(timespec="seconds"),
             "planned_seconds": int(round(self.planned)),
             "active_seconds": round(active, 1),
+            "paused_seconds": round(paused),
             "completed": bool(completed),
+            "end_reason": end_reason,
             "distractions": [t for t in self.distractions if t <= active + 0.5],
             "pause_count": self.pause_count,
+            "events": events,
             "machine": socket.gethostname() or platform.node() or "pc",
             "platform": platform.system(),
         }
@@ -738,6 +1100,8 @@ class IPCServer(threading.Thread):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         if IS_WINDOWS and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        elif not IS_WINDOWS:  # lets a restarted copy reuse the port straight away
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((IPC_HOST, IPC_PORT))
         self.sock.listen(5)
 
@@ -778,7 +1142,8 @@ class FocusWidget:
     def __init__(self, app, preview=False):
         self.app = app
         self.preview = preview
-        self.body, self.dot = W_BODY, W_DOT
+        self.pal = app.dot_palette()
+        self.body, self.dot = self.pal["body"], self.pal["dot"]
         self.text = None
         self.w = self.h = 0
         self.x = self.y = None
@@ -837,6 +1202,12 @@ class FocusWidget:
         self.text = None
         self.render()
 
+    def retheme(self):
+        self._cancel_anim()
+        self.pal = self.app.dot_palette()
+        self.body, self.dot = self.pal["body"], self.pal["dot"]
+        self.render()
+
     def set_opacity(self, value):
         try:
             self.win.attributes("-alpha", max(0.1, min(1.0, float(value))))
@@ -883,7 +1254,7 @@ class FocusWidget:
         else:
             c.create_oval(x0, y0, x0 + d, y0 + d, fill=self.dot, outline=self.dot)
         if text:
-            c.create_text(x0 + d + gap, h / 2, text=text, anchor="w", fill=W_TEXT, font=self.font)
+            c.create_text(x0 + d + gap, h / 2, text=text, anchor="w", fill=self.pal["text"], font=self.font)
 
     def _apply_geometry(self, w, h):
         vx, vy, vw, vh = virtual_screen(self.win)
@@ -919,7 +1290,7 @@ class FocusWidget:
             except tk.TclError:
                 pass
         self.jobs = []
-        self.body, self.dot = W_BODY, W_DOT
+        self.body, self.dot = self.pal["body"], self.pal["dot"]
 
     def _set_colors(self, body, dot):
         self.body, self.dot = body, dot
@@ -927,16 +1298,17 @@ class FocusWidget:
 
     def feedback(self, mode):
         self._cancel_anim()
+        pal = self.pal
         if mode in ("flash", "flash_buzz"):
-            self._set_colors(W_RED_BODY, W_RED_DOT)
+            self._set_colors(pal["red_body"], pal["red_dot"])
             steps = 10
             for i in range(1, steps + 1):
                 t = i / steps
                 self.jobs.append(self.win.after(350 + i * 45, lambda t=t: self._set_colors(
-                    mix(W_RED_BODY, W_BODY, t), mix(W_RED_DOT, W_DOT, t))))
+                    mix(pal["red_body"], pal["body"], t), mix(pal["red_dot"], pal["dot"], t))))
         else:
-            self._set_colors(W_BODY, W_DOT_BLINK)
-            self.jobs.append(self.win.after(170, lambda: self._set_colors(W_BODY, W_DOT)))
+            self._set_colors(pal["body"], pal["blink"])
+            self.jobs.append(self.win.after(170, lambda: self._set_colors(pal["body"], pal["dot"])))
         if mode in ("buzz", "flash_buzz"):
             self.app.sounds.buzz(self.app.settings["buzz_volume"])
 
@@ -1001,8 +1373,8 @@ class FocusWidget:
 
 class Chart(tk.Canvas):
     def __init__(self, parent, app, height):
-        super().__init__(parent, height=app.px(height), bg=SURFACE, highlightthickness=1,
-                         highlightbackground=BORDER, highlightcolor=BORDER, bd=0)
+        super().__init__(parent, height=app.px(height), bg=C.surface, highlightthickness=1,
+                         highlightbackground=C.border, highlightcolor=C.border, bd=0)
         self.app = app
         self.s = app.scale
         self.hits = []
@@ -1012,6 +1384,10 @@ class Chart(tk.Canvas):
         self.bind("<Configure>", lambda _e: self.redraw())
         self.bind("<Motion>", self._on_motion)
         self.bind("<Leave>", lambda _e: self._clear_hover())
+
+    def retheme(self):
+        self.configure(bg=C.surface, highlightbackground=C.border, highlightcolor=C.border)
+        self.redraw()
 
     def redraw(self):
         self.delete("all")
@@ -1026,13 +1402,13 @@ class Chart(tk.Canvas):
 
     def title(self, title, subtitle):
         p = self.app.px
-        self.create_text(p(16), p(14), text=title, anchor="nw", font=self.app.f_h3, fill=INK)
+        self.create_text(p(16), p(14), text=title, anchor="nw", font=self.app.f_h3, fill=C.ink)
         if subtitle:
             self.create_text(p(16), p(14) + self.app.f_h3.metrics("linespace") + p(2), text=subtitle,
-                             anchor="nw", font=self.app.f_small, fill=MUTED)
+                             anchor="nw", font=self.app.f_small, fill=C.muted)
 
     def empty(self, w, h, text):
-        self.create_text(w / 2, h / 2 + self.app.px(10), text=text, fill=MUTED, font=self.app.f_body,
+        self.create_text(w / 2, h / 2 + self.app.px(10), text=text, fill=C.muted, font=self.app.f_body,
                          width=w - self.app.px(40), justify="center")
 
     def y_axis(self, x0, x1, y0, y1, vmax, fmt=None):
@@ -1042,9 +1418,9 @@ class Chart(tk.Canvas):
         for t in ticks:
             y = y1 - (t / top) * (y1 - y0)
             if t > 0:
-                self.create_line(x0, y, x1, y, fill=GRID)
-            self.create_text(x0 - self.app.px(8), y, text=fmt(t), anchor="e", fill=MUTED, font=self.app.f_tiny)
-        self.create_line(x0, y1, x1, y1, fill=AXIS)
+                self.create_line(x0, y, x1, y, fill=C.grid)
+            self.create_text(x0 - self.app.px(8), y, text=fmt(t), anchor="e", fill=C.muted, font=self.app.f_tiny)
+        self.create_line(x0, y1, x1, y1, fill=C.axis)
         return lambda v: y1 - (v / top) * (y1 - y0)
 
     # -- hover ------------------------------------------------------------
@@ -1077,13 +1453,13 @@ class Chart(tk.Canvas):
         p = self.app.px
         if self.hit_mode == "x" and self.plot:
             _, y0, _, y1 = self.plot
-            self.create_line(hit["x"], y0, hit["x"], y1, fill=AXIS, tags="hover")
+            self.create_line(hit["x"], y0, hit["x"], y1, fill=C.axis, tags="hover")
         for (rx, ry, r, color) in hit.get("rings", []):
             self.create_oval(rx - r - p(2), ry - r - p(2), rx + r + p(2), ry + r + p(2),
-                             fill=SURFACE, outline=SURFACE, tags="hover")
+                             fill=C.surface, outline=C.surface, tags="hover")
             self.create_oval(rx - r, ry - r, rx + r, ry + r, fill=color, outline=color, tags="hover")
         pad = p(7)
-        tid = self.create_text(0, 0, text="\n".join(hit["lines"]), anchor="nw", fill=TIP_FG,
+        tid = self.create_text(0, 0, text="\n".join(hit["lines"]), anchor="nw", fill=C.tip_fg,
                                font=self.app.f_small, tags="hover")
         bx0, by0, bx1, by1 = self.bbox(tid)
         tw, th = bx1 - bx0, by1 - by0
@@ -1096,7 +1472,7 @@ class Chart(tk.Canvas):
             ty = ay + p(14)
         self.coords(tid, tx + pad, ty + pad)
         rect = rounded_rect(self, tx, ty, tx + tw + 2 * pad, ty + th + 2 * pad, p(4),
-                            fill=TIP_BG, outline=TIP_BG, tags="hover")
+                            fill=C.tip_bg, outline=C.tip_bg, tags="hover")
         self.tag_raise(tid, rect)
 
 
@@ -1124,13 +1500,13 @@ class TrendChart(Chart):
         # legend, top right
         lx = w - p(16)
         t2 = self.create_text(lx, p(20), text=f"{ROLLING_WINDOW}-session average", anchor="e",
-                              fill=INK_2, font=self.app.f_small)
+                              fill=C.ink2, font=self.app.f_small)
         bx0 = self.bbox(t2)[0]
-        self.create_line(bx0 - p(26), p(20), bx0 - p(8), p(20), fill=ACCENT, width=p(2), capstyle="round")
-        t1 = self.create_text(bx0 - p(40), p(20), text="Each session", anchor="e", fill=INK_2, font=self.app.f_small)
+        self.create_line(bx0 - p(26), p(20), bx0 - p(8), p(20), fill=C.series, width=p(2), capstyle="round")
+        t1 = self.create_text(bx0 - p(40), p(20), text="Each session", anchor="e", fill=C.ink2, font=self.app.f_small)
         bx1 = self.bbox(t1)[0]
         r0 = p(4)
-        self.create_oval(bx1 - p(8) - 2 * r0, p(20) - r0, bx1 - p(8), p(20) + r0, fill=ACCENT_LIGHT, outline=ACCENT_LIGHT)
+        self.create_oval(bx1 - p(8) - 2 * r0, p(20) - r0, bx1 - p(8), p(20) + r0, fill=C.series_soft, outline=C.series_soft)
 
         x0, x1, y0, y1 = p(56), w - p(66), p(70), h - p(30)
         self.plot = (x0, y0, x1, y1)
@@ -1151,17 +1527,17 @@ class TrendChart(Chart):
         for x, v in zip(xs, values):
             if ymap(v) < ytop:  # off the scale: a small up-arrow at the top edge
                 self.create_polygon(x, ytop - r - p(2), x - r - p(1), ytop + r, x + r + p(1), ytop + r,
-                                    fill=ACCENT_LIGHT, outline=ACCENT_LIGHT)
+                                    fill=C.series_soft, outline=C.series_soft)
             else:
-                self.create_oval(x - r, ymap(v) - r, x + r, ymap(v) + r, fill=ACCENT_LIGHT, outline=SURFACE)
+                self.create_oval(x - r, ymap(v) - r, x + r, ymap(v) + r, fill=C.series_soft, outline=C.surface)
         if n >= 2:
             coords = []
             for x, v in zip(xs, rolling):
                 coords += [x, ymap(v)]
-            self.create_line(*coords, fill=ACCENT, width=p(2), capstyle="round", joinstyle="round")
+            self.create_line(*coords, fill=C.series, width=p(2), capstyle="round", joinstyle="round")
         # direct label for the latest average
         self.create_text(xs[-1] + p(8), ymap(rolling[-1]), text=d["fmt"](rolling[-1]), anchor="w",
-                         fill=INK, font=self.app.f_small_bold)
+                         fill=C.ink, font=self.app.f_small_bold)
 
         # x labels: a handful of dates, evenly spread
         k = min(n, max(2, int((x1 - x0) / p(90))))
@@ -1169,12 +1545,12 @@ class TrendChart(Chart):
         for i in idxs:
             anchor = "n" if 0 < i < n - 1 or n == 1 else ("nw" if i == 0 else "ne")
             self.create_text(xs[i], y1 + p(8), text=short_date(pts[i]["date"]), anchor=anchor,
-                             fill=MUTED, font=self.app.f_tiny)
+                             fill=C.muted, font=self.app.f_tiny)
 
         for x, pt in zip(xs, pts):
             y = max(ymap(pt["value"]), ytop)
             self.hits.append({"x": x, "y": y, "lines": pt["tip"], "reach": spacing / 2,
-                              "rings": [(x, y, r + p(1), ACCENT_DARK)]})
+                              "rings": [(x, y, r + p(1), C.series_strong)]})
 
 
 class BarChart(Chart):
@@ -1203,18 +1579,18 @@ class BarChart(Chart):
         bw = min(p(44), slot * 0.6)
         for i, c in enumerate(cats):
             cx = x0 + slot * (i + 0.5)
-            self.create_text(cx, y1 + p(7), text=c["label"], anchor="n", fill=INK_2, font=self.app.f_tiny)
+            self.create_text(cx, y1 + p(7), text=c["label"], anchor="n", fill=C.ink2, font=self.app.f_tiny)
             if c.get("sub"):
                 self.create_text(cx, y1 + p(7) + self.app.f_tiny.metrics("linespace"), text=c["sub"],
-                                 anchor="n", fill=MUTED, font=self.app.f_tiny)
+                                 anchor="n", fill=C.muted, font=self.app.f_tiny)
             if c["value"] is None:
-                self.create_text(cx, y1 - p(10), text="–", fill=MUTED, font=self.app.f_small)
+                self.create_text(cx, y1 - p(10), text="–", fill=C.muted, font=self.app.f_small)
             else:
                 top = ymap(c["value"])
-                color = ACCENT if c.get("highlight") else ACCENT_LIGHT
+                color = C.series if c.get("highlight") else C.series_soft
                 if y1 - top >= 1:
                     rounded_rect(self, cx - bw / 2, top, cx + bw / 2, y1, p(4), 0, fill=color, outline=color)
-                self.create_text(cx, top - p(4), text=d["fmt"](c["value"]), anchor="s", fill=INK_2,
+                self.create_text(cx, top - p(4), text=d["fmt"](c["value"]), anchor="s", fill=C.ink2,
                                  font=self.app.f_tiny)
             self.hits.append({"box": (cx - slot / 2, y0 - p(20), cx + slot / 2, y1 + p(30)),
                               "x": cx, "y": ymap(c["value"]) if c["value"] is not None else y1,
@@ -1242,27 +1618,27 @@ class TimelineStrip(Chart):
         x0, x1, y = p(4), w - p(4), p(34)
         th = p(6)
         xmap = lambda t: x0 + (t / dur) * (x1 - x0)  # noqa: E731
-        rounded_rect(self, x0, y - th / 2, x1, y + th / 2, th / 2, fill=GRID, outline=GRID)
+        rounded_rect(self, x0, y - th / 2, x1, y + th / 2, th / 2, fill=C.grid, outline=C.grid)
         lx0, lx1 = xmap(m["longest_start"]), xmap(m["longest_start"] + m["longest"])
         if lx1 - lx0 >= 2:
-            rounded_rect(self, lx0, y - th / 2, lx1, y + th / 2, th / 2, fill=ACCENT, outline=ACCENT)
+            rounded_rect(self, lx0, y - th / 2, lx1, y + th / 2, th / 2, fill=C.series, outline=C.series)
         label = f"Longest focus {fmt_duration(m['longest'])}"
         lw = self.app.f_tiny.measure(label)
         cx = min(max((lx0 + lx1) / 2, x0 + lw / 2), x1 - lw / 2)
-        self.create_text(cx, y - p(10), text=label, anchor="s", fill=ACCENT_DARK, font=self.app.f_tiny)
+        self.create_text(cx, y - p(10), text=label, anchor="s", fill=C.series_strong, font=self.app.f_tiny)
         for t in m["times"]:
             x = xmap(t)
-            self.create_line(x, y - p(9), x, y + p(9), fill=INK_2, width=p(2))
+            self.create_line(x, y - p(9), x, y + p(9), fill=C.ink2, width=p(2))
             self.hits.append({"box": (x - p(6), y - p(14), x + p(6), y + p(14)), "x": x, "y": y - p(6),
                               "lines": [f"Distracted at {fmt_offset(t)}"]})
-        self.create_text(x0, y + p(14), text="0:00", anchor="nw", fill=MUTED, font=self.app.f_tiny)
-        self.create_text(x1, y + p(14), text=fmt_offset(dur), anchor="ne", fill=MUTED, font=self.app.f_tiny)
+        self.create_text(x0, y + p(14), text="0:00", anchor="nw", fill=C.muted, font=self.app.f_tiny)
+        self.create_text(x1, y + p(14), text=fmt_offset(dur), anchor="ne", fill=C.muted, font=self.app.f_tiny)
 
 
 class ScrollFrame(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
-        self.canvas = tk.Canvas(self, bg=PAGE, highlightthickness=0, bd=0)
+        self.canvas = tk.Canvas(self, bg=C.page, highlightthickness=0, bd=0)
         self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.vsb.set)
         self.vsb.pack(side="right", fill="y")
@@ -1271,6 +1647,9 @@ class ScrollFrame(ttk.Frame):
         self.win = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
         self.inner.bind("<Configure>", lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self.win, width=e.width))
+
+    def retheme(self):
+        self.canvas.configure(bg=C.page)
 
     def scroll(self, units):
         if self.inner.winfo_height() > self.canvas.winfo_height():
@@ -1319,8 +1698,17 @@ class App:
         self.tick_job = None
         self.last_autosave = 0.0
         self.last_result = None
+        self.last_result_fresh = False
+        self.hotkey_status_role = ("", "muted")
+        self.update_status_role = ("", "muted")
+        self.pending_update = None
+        self.update_checking = False
+        self.csv_note = ""
 
         root.report_callback_exception = self._report_error
+        self.system_theme = detect_system_theme()
+        self.theme = self._wanted_theme()
+        C.__dict__.update(DARK if self.theme == "dark" else LIGHT)
         self._setup_fonts()
         self._setup_style()
         self.sounds = Sounds(self.cfg_dir, root)
@@ -1333,9 +1721,15 @@ class App:
         if self.sessions:
             self.show_results(self.sessions[-1], fresh=False)
         self.apply_hotkey()
+        self.auto_export()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(50, self._poll_queue)
         root.after(400, self._check_unfinished)
+        root.after(100, self._set_title_bar)
+        root.after(3000, self._poll_theme)
+        root.after(600, self._after_update_notice)
+        if self.settings["check_updates"]:
+            root.after(2500, lambda: self.check_updates(manual=False))
 
     # -- basics ---------------------------------------------------------------
     def px(self, n):
@@ -1383,80 +1777,153 @@ class App:
 
     def _setup_style(self):
         r = self.root
-        r.configure(bg=PAGE)
+        r.configure(bg=C.page)
         st = ttk.Style(r)
-        st.theme_use("clam")
+        if st.theme_use() != "clam":
+            st.theme_use("clam")
         p = self.px
-        st.configure(".", background=PAGE, foreground=INK, font=self.f_body, bordercolor=BORDER,
-                     lightcolor=PAGE, darkcolor=PAGE, troughcolor=GRID, focuscolor=ACCENT_LIGHT,
-                     selectbackground=ACCENT_WASH, selectforeground=INK, insertcolor=INK)
-        st.configure("TFrame", background=PAGE)
-        st.configure("Card.TFrame", background=SURFACE, bordercolor=BORDER, relief="solid", borderwidth=1)
-        st.configure("CardInner.TFrame", background=SURFACE, borderwidth=0, relief="flat")
-        st.configure("TLabel", background=PAGE, foreground=INK)
+        st.configure(".", background=C.page, foreground=C.ink, font=self.f_body, bordercolor=C.border,
+                     lightcolor=C.page, darkcolor=C.page, troughcolor=C.grid, focuscolor=C.focus,
+                     selectbackground=C.select, selectforeground=C.ink, insertcolor=C.ink)
+        st.configure("TFrame", background=C.page)
+        st.configure("Card.TFrame", background=C.surface, bordercolor=C.border, relief="solid", borderwidth=1)
+        st.configure("CardInner.TFrame", background=C.surface, borderwidth=0, relief="flat")
+        st.configure("TLabel", background=C.page, foreground=C.ink)
         st.configure("H1.TLabel", font=self.f_h1)
         st.configure("H2.TLabel", font=self.f_h2)
         st.configure("H3.TLabel", font=self.f_h3)
-        st.configure("Sub.TLabel", foreground=INK_2)
-        st.configure("Muted.TLabel", foreground=MUTED, font=self.f_small)
-        st.configure("Card.TLabel", background=SURFACE)
-        st.configure("CardH2.TLabel", background=SURFACE, font=self.f_h2)
-        st.configure("CardBig.TLabel", background=SURFACE, font=self.f_big)
-        st.configure("CardMuted.TLabel", background=SURFACE, foreground=MUTED, font=self.f_small)
-        st.configure("CardSub.TLabel", background=SURFACE, foreground=INK_2, font=self.f_small)
+        st.configure("Sub.TLabel", foreground=C.ink2)
+        st.configure("Muted.TLabel", foreground=C.muted, font=self.f_small)
+        st.configure("Card.TLabel", background=C.surface)
+        st.configure("CardH2.TLabel", background=C.surface, font=self.f_h2)
+        st.configure("CardBig.TLabel", background=C.surface, font=self.f_big)
+        st.configure("CardMuted.TLabel", background=C.surface, foreground=C.muted, font=self.f_small)
+        st.configure("CardSub.TLabel", background=C.surface, foreground=C.ink2, font=self.f_small)
 
-        st.configure("TButton", background=SURFACE, foreground=INK, bordercolor=AXIS, lightcolor=SURFACE,
-                     darkcolor=SURFACE, padding=(p(12), p(5)), width=0)
-        st.map("TButton", background=[("disabled", PAGE), ("pressed", GRID), ("active", HOVER)],
-               foreground=[("disabled", MUTED)], lightcolor=[("active", HOVER)], darkcolor=[("active", HOVER)])
-        st.configure("Accent.TButton", background=ACCENT, foreground="#ffffff", bordercolor=ACCENT,
-                     lightcolor=ACCENT, darkcolor=ACCENT, padding=(p(26), p(10)), font=self.f_h3)
+        st.configure("TButton", background=C.surface, foreground=C.ink, bordercolor=C.axis, lightcolor=C.surface,
+                     darkcolor=C.surface, padding=(p(12), p(5)), width=0)
+        st.map("TButton", background=[("disabled", C.page), ("pressed", C.grid), ("active", C.hover)],
+               foreground=[("disabled", C.muted)], lightcolor=[("active", C.hover)], darkcolor=[("active", C.hover)])
+        st.configure("Accent.TButton", background=C.accent, foreground=C.on_accent, bordercolor=C.accent,
+                     lightcolor=C.accent, darkcolor=C.accent, padding=(p(26), p(10)), font=self.f_h3)
         st.map("Accent.TButton",
-               background=[("pressed", ACCENT_DARK), ("active", ACCENT_HOVER)],
-               lightcolor=[("pressed", ACCENT_DARK), ("active", ACCENT_HOVER)],
-               darkcolor=[("pressed", ACCENT_DARK), ("active", ACCENT_HOVER)],
-               bordercolor=[("pressed", ACCENT_DARK), ("active", ACCENT_HOVER)])
-        st.configure("Seg.Toolbutton", background=SURFACE, foreground=INK_2, bordercolor=AXIS,
-                     lightcolor=SURFACE, darkcolor=SURFACE, padding=(p(12), p(6)), anchor="center")
+               background=[("pressed", C.accent_press), ("active", C.accent_hover)],
+               lightcolor=[("pressed", C.accent_press), ("active", C.accent_hover)],
+               darkcolor=[("pressed", C.accent_press), ("active", C.accent_hover)],
+               bordercolor=[("pressed", C.accent_press), ("active", C.accent_hover)])
+        st.configure("Seg.Toolbutton", background=C.surface, foreground=C.ink2, bordercolor=C.axis,
+                     lightcolor=C.surface, darkcolor=C.surface, padding=(p(12), p(6)), anchor="center")
         st.map("Seg.Toolbutton",
-               background=[("selected", ACCENT), ("active", HOVER)],
-               foreground=[("selected", "#ffffff")],
-               bordercolor=[("selected", ACCENT)],
-               lightcolor=[("selected", ACCENT), ("active", HOVER)],
-               darkcolor=[("selected", ACCENT), ("active", HOVER)])
+               background=[("selected", C.accent), ("active", C.hover)],
+               foreground=[("selected", C.on_accent)],
+               bordercolor=[("selected", C.accent)],
+               lightcolor=[("selected", C.accent), ("active", C.hover)],
+               darkcolor=[("selected", C.accent), ("active", C.hover)])
 
-        st.configure("TNotebook", background=PAGE, borderwidth=0, tabmargins=(p(16), p(10), p(16), 0))
-        st.configure("TNotebook.Tab", background=PAGE, foreground=INK_2, padding=(p(16), p(7)),
-                     bordercolor=PAGE, lightcolor=PAGE, darkcolor=PAGE)
-        st.map("TNotebook.Tab", background=[("selected", SURFACE), ("active", HOVER)],
-               foreground=[("selected", INK)], bordercolor=[("selected", BORDER)],
-               lightcolor=[("selected", SURFACE)])
-        st.configure("Treeview", background=SURFACE, fieldbackground=SURFACE, foreground=INK,
-                     rowheight=p(26), bordercolor=BORDER)
-        st.configure("Treeview.Heading", background=PAGE, foreground=INK_2, font=self.f_small_bold,
-                     relief="flat", bordercolor=BORDER, lightcolor=PAGE, darkcolor=PAGE)
-        st.map("Treeview.Heading", background=[("active", HOVER)])
-        st.map("Treeview", background=[("selected", ACCENT_WASH)], foreground=[("selected", INK)])
+        st.configure("TNotebook", background=C.page, borderwidth=0, tabmargins=(p(16), p(10), p(16), 0))
+        st.configure("TNotebook.Tab", background=C.page, foreground=C.ink2, padding=(p(16), p(7)),
+                     bordercolor=C.page, lightcolor=C.page, darkcolor=C.page)
+        st.map("TNotebook.Tab", background=[("selected", C.surface), ("active", C.hover)],
+               foreground=[("selected", C.ink)], bordercolor=[("selected", C.border)],
+               lightcolor=[("selected", C.surface)])
+        st.configure("Treeview", background=C.surface, fieldbackground=C.surface, foreground=C.ink,
+                     rowheight=p(26), bordercolor=C.border)
+        st.configure("Treeview.Heading", background=C.page, foreground=C.ink2, font=self.f_small_bold,
+                     relief="flat", bordercolor=C.border, lightcolor=C.page, darkcolor=C.page)
+        st.map("Treeview.Heading", background=[("active", C.hover)])
+        st.map("Treeview", background=[("selected", C.select)], foreground=[("selected", C.ink)])
         for name in ("TRadiobutton", "TCheckbutton"):
-            st.configure(name, background=PAGE, indicatorbackground=SURFACE, indicatormargin=(0, 0, p(6), 0))
-            st.map(name, background=[("active", PAGE)], indicatorbackground=[("selected", ACCENT), ("pressed", GRID)],
-                   indicatorforeground=[("selected", "#ffffff")])
+            st.configure(name, background=C.page, indicatorbackground=C.field, indicatormargin=(0, 0, p(6), 0),
+                         upperbordercolor=C.axis, lowerbordercolor=C.axis)
+            st.map(name, background=[("active", C.page)], indicatorbackground=[("selected", C.accent), ("pressed", C.grid)],
+                   indicatorforeground=[("selected", C.on_accent)])
         for name in ("TEntry", "TSpinbox", "TCombobox"):
-            st.configure(name, fieldbackground=SURFACE, bordercolor=AXIS, lightcolor=SURFACE, darkcolor=SURFACE,
-                         padding=(p(6), p(4)), arrowcolor=INK_2)
-        st.map("TCombobox", fieldbackground=[("readonly", SURFACE)], selectbackground=[("readonly", SURFACE)],
-               selectforeground=[("readonly", INK)])
-        st.configure("Horizontal.TScale", background=PAGE, troughcolor=GRID, bordercolor=AXIS,
-                     lightcolor=SURFACE, darkcolor=SURFACE)
-        st.configure("Vertical.TScrollbar", background=PAGE, troughcolor=PAGE, bordercolor=PAGE,
-                     arrowcolor=MUTED, lightcolor=PAGE, darkcolor=PAGE)
-        st.map("Vertical.TScrollbar", background=[("active", GRID)])
-        r.option_add("*TCombobox*Listbox.background", SURFACE)
-        r.option_add("*TCombobox*Listbox.selectBackground", ACCENT_WASH)
-        r.option_add("*TCombobox*Listbox.selectForeground", INK)
-        r.option_add("*Menu.background", SURFACE)
-        r.option_add("*Menu.activeBackground", ACCENT_WASH)
-        r.option_add("*Menu.activeForeground", INK)
+            st.configure(name, fieldbackground=C.field, foreground=C.ink, background=C.surface, bordercolor=C.axis,
+                         lightcolor=C.field, darkcolor=C.field, padding=(p(6), p(4)), arrowcolor=C.ink2)
+            st.map(name, fieldbackground=[("readonly", C.field), ("disabled", C.page)],
+                   foreground=[("disabled", C.muted)], background=[("active", C.hover)])
+        st.map("TCombobox", selectbackground=[("readonly", C.field)], selectforeground=[("readonly", C.ink)])
+        st.configure("Horizontal.TScale", background=C.surface, troughcolor=C.grid, bordercolor=C.axis,
+                     lightcolor=C.surface, darkcolor=C.surface)
+        st.map("Horizontal.TScale", background=[("active", C.hover)])
+        st.configure("Vertical.TScrollbar", background=C.grid, troughcolor=C.page, bordercolor=C.page,
+                     arrowcolor=C.muted, lightcolor=C.grid, darkcolor=C.grid)
+        st.map("Vertical.TScrollbar", background=[("active", C.axis)])
+        # classic Tk pieces (menus, dialogs, combobox lists) read the option database
+        for pattern, value in (
+                ("*Background", C.page), ("*Foreground", C.ink), ("*activeBackground", C.hover),
+                ("*activeForeground", C.ink), ("*selectBackground", C.select), ("*selectForeground", C.ink),
+                ("*highlightBackground", C.page), ("*highlightColor", C.focus), ("*insertBackground", C.ink),
+                ("*troughColor", C.grid), ("*Entry.background", C.field), ("*Listbox.background", C.field),
+                ("*TCombobox*Listbox.background", C.field), ("*TCombobox*Listbox.foreground", C.ink),
+                ("*TCombobox*Listbox.selectBackground", C.select), ("*TCombobox*Listbox.selectForeground", C.ink),
+                ("*Menu.background", C.surface), ("*Menu.foreground", C.ink),
+                ("*Menu.activeBackground", C.select), ("*Menu.activeForeground", C.ink),
+                ("*Menu.disabledForeground", C.muted)):
+            r.option_add(pattern, value)
+
+    # -- light / dark theme ---------------------------------------------------------
+    def _wanted_theme(self):
+        mode = self.settings["appearance"]
+        return mode if mode in ("light", "dark") else self.system_theme
+
+    def dot_palette(self):
+        mode = self.settings["dot_theme"]
+        mode = mode if mode in ("light", "dark") else self.system_theme
+        return DOT_DARK if mode == "dark" else DOT_LIGHT
+
+    def _poll_theme(self):
+        if "system" in (self.settings["appearance"], self.settings["dot_theme"]):
+            found = detect_system_theme()
+            if found != self.system_theme:
+                self.system_theme = found
+                self.apply_theme()
+        self.root.after(3000, self._poll_theme)
+
+    def apply_theme(self):
+        wanted = self._wanted_theme()
+        if wanted != self.theme:
+            self.theme = wanted
+            C.__dict__.update(DARK if wanted == "dark" else LIGHT)
+            self._setup_style()
+            stack = [self.root]
+            while stack:
+                w = stack.pop()
+                stack.extend(w.winfo_children())
+                if hasattr(w, "retheme"):
+                    w.retheme()
+            self.tree.tag_configure("odd", background=C.stripe)
+            try:  # an already-created combobox drop-down keeps its colours otherwise
+                popdown = self.root.tk.call("ttk::combobox::PopdownWindow", self.period_combo)
+                self.root.tk.call(f"{popdown}.f.l", "configure", "-background", C.field, "-foreground", C.ink,
+                                  "-selectbackground", C.select, "-selectforeground", C.ink)
+            except tk.TclError:
+                pass
+            self._set_title_bar()
+            self.refresh_progress()
+            if self.last_result is not None:
+                self.show_results(self.last_result, fresh=self.last_result_fresh)
+            self._hotkey_msg(*self.hotkey_status_role)
+            self._update_msg(*self.update_status_role)
+        for w in (self.widget, self.preview):
+            if w is not None and w.pal is not self.dot_palette():
+                w.retheme()
+
+    def _set_title_bar(self):
+        """Dark title bar on Windows 10/11 (Linux window managers follow the system theme themselves)."""
+        if not IS_WINDOWS:
+            return
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            value = ctypes.c_int(1 if self.theme == "dark" else 0)
+            for attribute in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (newer and older Windows builds)
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(value),
+                                                              ctypes.sizeof(value)) == 0:
+                    break
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+        except Exception:
+            pass
 
     def _set_icon(self):
         size = 32
@@ -1468,7 +1935,7 @@ class App:
                 dx, dy = abs(x - 15.5), abs(y - 15.5)
                 inside = (max(dx - 9, 0) ** 2 + max(dy - 9, 0) ** 2) <= 36 and dx < 15.5 and dy < 15.5
                 dot = math.hypot(x - 15.5, y - 15.5) <= 6.5
-                row.append(W_DOT_BLINK if dot else (W_BODY if inside else PAGE))
+                row.append(DOT_DARK["blink"] if dot else (DOT_DARK["body"] if inside else C.page))
             rows.append("{" + " ".join(row) + "}")
         img.put(" ".join(rows))
         self._icon = img
@@ -1596,8 +2063,8 @@ class App:
         head.pack(fill="x")
         ttk.Label(head, text="Progress", style="H1.TLabel").pack(side="left")
         self.period_var = tk.StringVar(value="Last 30 days")
-        combo = ttk.Combobox(head, textvariable=self.period_var, values=[n for n, _ in self.PERIODS],
-                             state="readonly", width=15)
+        combo = self.period_combo = ttk.Combobox(head, textvariable=self.period_var, state="readonly", width=15,
+                                                 values=[n for n, _ in self.PERIODS])
         combo.pack(side="right")
         combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_progress())
         ttk.Label(head, text="Show", style="Sub.TLabel").pack(side="right", padx=(0, p(8)))
@@ -1664,7 +2131,7 @@ class App:
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         self.tree.pack(side="left", fill="both", expand=True)
-        self.tree.tag_configure("odd", background=PAGE)
+        self.tree.tag_configure("odd", background=C.stripe)
 
         btns = ttk.Frame(outer)
         btns.pack(fill="x", pady=(p(12), 0))
@@ -1673,6 +2140,9 @@ class App:
         ttk.Button(btns, text="Open data folder", command=lambda: open_folder(self.store.sessions_dir)).pack(
             side="left", padx=(p(8), 0))
         ttk.Button(btns, text="Refresh", command=self.reload_sessions).pack(side="right")
+        ttk.Label(outer, text="Export CSV… saves two files: one row per session, and one row per event (every press, "
+                              "pause, resume and undo). If you select\nsessions in the list, only those are exported.",
+                  style="Muted.TLabel", justify="left").pack(anchor="w", pady=(p(8), 0))
 
     # Settings tab ---------------------------------------------------------------
     def _section(self, parent, title, first=False):
@@ -1725,6 +2195,15 @@ class App:
         ttk.Scale(row, from_=15, to=100, variable=self.opacity_var, length=p(160),
                   command=lambda v: self._set("widget_opacity", round(float(v)) / 100.0)).pack(side="left")
         row = ttk.Frame(box)
+        row.pack(anchor="w", pady=(p(10), 0))
+        ttk.Label(row, text="Colour").pack(side="left", padx=(0, p(10)))
+        self.dot_theme_var = tk.StringVar(value=s["dot_theme"])
+        for value, label in THEME_CHOICES:
+            ttk.Radiobutton(row, text=label, value=value, variable=self.dot_theme_var, style="Seg.Toolbutton",
+                            command=lambda: self._set("dot_theme", self.dot_theme_var.get())).pack(side="left", padx=(0, p(4)))
+        ttk.Label(row, text="  The dot is least noticeable when it blends with the page you read.",
+                  style="Muted.TLabel").pack(side="left", padx=(p(8), 0))
+        row = ttk.Frame(box)
         row.pack(anchor="w", pady=(p(12), 0))
         self.preview_btn = ttk.Button(row, text="Show preview", command=self.toggle_preview)
         self.preview_btn.pack(side="left")
@@ -1732,6 +2211,18 @@ class App:
         ttk.Label(box, text="Use the preview to place the widget where you want it before you start reading. "
                             "Clicking the preview tries out your feedback setting.",
                   style="Muted.TLabel").pack(anchor="w", pady=(p(6), 0))
+
+        # appearance
+        box = self._section(outer, "Appearance")
+        row = ttk.Frame(box)
+        row.pack(anchor="w")
+        ttk.Label(row, text="Theme").pack(side="left", padx=(0, p(10)))
+        self.appearance_var = tk.StringVar(value=s["appearance"])
+        for value, label in THEME_CHOICES:
+            ttk.Radiobutton(row, text=label, value=value, variable=self.appearance_var, style="Seg.Toolbutton",
+                            command=lambda: self._set("appearance", self.appearance_var.get())).pack(side="left", padx=(0, p(4)))
+        ttk.Label(box, text="Match system follows the light or dark setting of Windows or Zorin and switches as soon "
+                            "as you change it.", style="Muted.TLabel").pack(anchor="w", pady=(p(6), 0))
 
         # session
         box = self._section(outer, "Session")
@@ -1772,7 +2263,7 @@ class App:
         cmd.pack(anchor="w", fill="x")
 
         # data
-        box = self._section(outer, "Session history folder")
+        box = self._section(outer, "Session history and CSV files")
         row = ttk.Frame(box)
         row.pack(fill="x")
         ttk.Button(row, text="Open", command=lambda: open_folder(self.store.sessions_dir)).pack(side="right")
@@ -1784,7 +2275,33 @@ class App:
                             "a Dropbox, OneDrive or Syncthing\nfolder, on each computer. Each session is its own small "
                             "file, so syncing never causes conflicts.",
                   style="Muted.TLabel", justify="left").pack(anchor="w", pady=(p(6), 0))
-        ttk.Label(outer, text=f"{APP_NAME} {APP_VERSION}\nSettings for this computer: {self.cfg_dir}",
+        row = ttk.Frame(box)
+        row.pack(anchor="w", fill="x", pady=(p(12), 0))
+        self.auto_csv_var = tk.BooleanVar(value=s["auto_csv"])
+        ttk.Checkbutton(row, text="Keep up-to-date CSV files of every session in this folder",
+                        variable=self.auto_csv_var, command=self._toggle_auto_csv).pack(side="left")
+        ttk.Button(row, text="Open CSV folder", command=lambda: open_folder(self.csv_folder())).pack(
+            side="left", padx=(p(12), 0))
+        self.csv_status = ttk.Label(box, style="Muted.TLabel", justify="left")
+        self.csv_status.pack(anchor="w", pady=(p(6), 0))
+
+        # updates
+        box = self._section(outer, "Updates")
+        self.check_updates_var = tk.BooleanVar(value=s["check_updates"])
+        row = ttk.Frame(box)
+        row.pack(anchor="w", fill="x")
+        ttk.Checkbutton(row, text="Check for updates when the app starts", variable=self.check_updates_var,
+                        command=lambda: self._set("check_updates", self.check_updates_var.get())).pack(side="left")
+        ttk.Button(row, text="Check now", command=lambda: self.check_updates(manual=True)).pack(
+            side="left", padx=(p(12), 0))
+        self.update_status = ttk.Label(box, style="Muted.TLabel", justify="left")
+        self.update_status.pack(anchor="w", pady=(p(6), 0))
+        how = "runs 'git pull' (this copy is a Git clone)" if is_git_checkout() else "replaces the app's files"
+        ttk.Label(box, text=f"You have version {APP_VERSION}. Updates come from github.com/{UPDATE_REPO} "
+                            f"({UPDATE_BRANCH} branch). Installing one {how},\nafter backing up the current "
+                            "version. Your sessions and settings aren't touched.",
+                  style="Muted.TLabel", justify="left").pack(anchor="w", pady=(p(4), 0))
+        ttk.Label(outer, text=f"{APP_NAME} {APP_VERSION}\nApp folder: {APP_DIR}\nSettings for this computer: {self.cfg_dir}",
                   style="Muted.TLabel", justify="left").pack(anchor="w", pady=(p(30), 0))
 
     def _show_folder(self):
@@ -1795,6 +2312,9 @@ class App:
 
     def _set(self, key, value):
         self.settings[key] = value
+        if key in ("appearance", "dot_theme"):
+            self.apply_theme()
+            return
         for w in (self.widget, self.preview):
             if w is None:
                 continue
@@ -1837,7 +2357,7 @@ class App:
         if s.check_suspend():
             self._save_in_progress()
         if not s.paused and s.remaining() <= 0:
-            self.finish_session(completed=True)
+            self.finish_session(completed=True, reason="completed")
             return
         if self.widget:
             self.widget.render()
@@ -1866,7 +2386,7 @@ class App:
         s = self.session
         if s is None or s.paused:
             return
-        if s.log():
+        if s.log(SOURCE_NAMES.get(source, source)):
             if self.widget:
                 self.widget.feedback(self.settings["feedback"])
             self._save_in_progress()
@@ -1895,9 +2415,9 @@ class App:
         self.show_main()
         if messagebox.askyesno("End session", "End this session now?\n\nIt will be saved as ended early.",
                                parent=self.root):
-            self.finish_session(completed=False)
+            self.finish_session(completed=False, reason="ended_early")
 
-    def finish_session(self, completed, confirm_short=True):
+    def finish_session(self, completed, reason, confirm_short=True):
         s = self.session
         if s is None:
             return
@@ -1908,7 +2428,8 @@ class App:
         if self.widget:
             self.widget.destroy()
             self.widget = None
-        rec = s.to_record(completed, {"feedback": self.settings["feedback"], "display": self.settings["display"]})
+        rec = s.to_record(completed, reason, {"feedback": self.settings["feedback"],
+                                              "display": self.settings["display"]})
         self._clear_in_progress()
         self.run_box.pack_forget()
         self.idle_box.pack(fill="x", anchor="w")
@@ -1937,6 +2458,9 @@ class App:
         self.show_results(saved, fresh=True)
         self.nb.select(self.tab_session)
         self.show_main()
+        self.auto_export()
+        if self.pending_update is not None:
+            self.root.after(1500, lambda: self.show_update_dialog(self.pending_update))
 
     def _save_record(self, rec):
         try:
@@ -1971,7 +2495,7 @@ class App:
             return
         self.last_autosave = time.monotonic()
         try:
-            write_json_atomic(self._in_progress_path(), self.session.to_record(False))
+            write_json_atomic(self._in_progress_path(), self.session.to_record(False, "unfinished"))
         except OSError:
             pass
 
@@ -1999,8 +2523,13 @@ class App:
                 f"({fmt_minutes(active)}, {plural(len(rec.get('distractions', [])), 'distraction')} logged).\n\n"
                 "Save it to your history as ended early?", parent=self.root):
             rec["completed"] = False
+            rec["end_reason"] = "recovered"
+            for ev in rec.get("events", [])[-1:]:
+                if ev.get("type") == "end":
+                    ev["reason"] = "recovered"
             self._save_record(rec)
             self.reload_sessions()
+            self.auto_export()
         self._clear_in_progress()
 
     # -- results / progress / history -----------------------------------------------
@@ -2012,6 +2541,7 @@ class App:
 
     def show_results(self, rec, fresh):
         self.last_result = rec
+        self.last_result_fresh = fresh
         m = rec["_m"]
         start = rec["_start"]
         self.res_title.configure(text="Session complete" if fresh and rec.get("completed") else
@@ -2033,7 +2563,7 @@ class App:
         avg = weighted_rate(earlier)
         if avg is None:
             self.res_compare.configure(text="This is your first session, so it's your baseline to improve on.",
-                                       foreground=INK_2)
+                                       foreground=C.ink2)
         else:
             text, color = change_text(m["rate"], avg, f"your previous {plural(len(earlier), 'session')} "
                                                       f"({avg:.1f} per 10 min)")
@@ -2079,21 +2609,21 @@ class App:
 
         def delta(new, old, lower_is_better):
             if not days:
-                return "All sessions", MUTED
+                return "All sessions", C.muted
             if new is None:
-                return "", MUTED
+                return "", C.muted
             if old is None:
-                return f"No sessions in {prev_label}", MUTED
+                return f"No sessions in {prev_label}", C.muted
             return change_text(new, old, prev_label, lower_is_better)
 
         tiles = [
-            ("Sessions", str(len(cur)), (f"{fmt_minutes(secs)} of reading" if cur else "None in this period", MUTED)),
+            ("Sessions", str(len(cur)), (f"{fmt_minutes(secs)} of reading" if cur else "None in this period", C.muted)),
             ("Distractions per 10 min", f"{rate_cur:.1f}" if rate_cur is not None else "–",
              delta(rate_cur, rate_prev, True)),
             ("Average longest focus", fmt_duration(mean_long) if mean_long is not None else "–",
              delta(mean_long, mean_long_prev, False)),
             ("Best focused stretch", fmt_duration(best["_m"]["longest"]) if best else "–",
-             (f"{long_date(best['_start'])}" if best else "", MUTED)),
+             (f"{long_date(best['_start'])}" if best else "", C.muted)),
         ]
         for (cap, val, (sub, color)), (cl, vl, sl) in zip(tiles, self.tiles):
             cl.configure(text=cap)
@@ -2125,13 +2655,6 @@ class App:
                                     tick_fmt=lambda v: f"{v:g}m")
 
         # time-of-day and weekday patterns
-        def bucket(r):
-            h = r["_start"].hour
-            for i, (_, _, a, b, _) in enumerate(TIME_BUCKETS):
-                if (a <= h < b) if a < b else (h >= a or h < b):
-                    return i
-            return 0
-
         def cats_for(groups, labels, subs, long_names):
             out = []
             rates = [weighted_rate(g) if g else None for g in groups]
@@ -2152,13 +2675,12 @@ class App:
         tod_groups = [[] for _ in TIME_BUCKETS]
         dow_groups = [[] for _ in WEEKDAYS]
         for r in cur:
-            tod_groups[bucket(r)].append(r)
+            tod_groups[time_bucket(r["_start"].hour)].append(r)
             dow_groups[r["_start"].weekday()].append(r)
         tod_names = [f"{b[0]} ({b[1].replace('–', ':00–')}:00)" for b in TIME_BUCKETS]
         tod_cats, tod_best, tod_rates = cats_for(tod_groups, [b[0] for b in TIME_BUCKETS],
                                                  [b[1] for b in TIME_BUCKETS], tod_names)
-        day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        dow_cats, dow_best, dow_rates = cats_for(dow_groups, WEEKDAYS, None, day_names)
+        dow_cats, dow_best, dow_rates = cats_for(dow_groups, WEEKDAYS, None, DAY_NAMES)
         self.chart_tod.set_data(title="By time of day", subtitle="Distractions per 10 min, by start time · lower is better",
                                 cats=tod_cats, fmt=lambda v: f"{v:.1f}", empty=empty)
         self.chart_dow.set_data(title="By day of week", subtitle="Distractions per 10 min · lower is better",
@@ -2167,9 +2689,9 @@ class App:
         if tod_best is not None:
             notes.append(f"You focus best {TIME_BUCKETS[tod_best][4]} ({tod_rates[tod_best]:.1f} per 10 min)")
         if dow_best is not None:
-            notes.append(f"your best day is {day_names[dow_best]} ({dow_rates[dow_best]:.1f})")
+            notes.append(f"your best day is {DAY_NAMES[dow_best]} ({dow_rates[dow_best]:.1f})")
         if notes:
-            text = "; ".join(notes) + ". The darker bar marks the best one."
+            text = "; ".join(notes) + ". The highlighted bar marks the best one."
             self.insight.configure(text=text[0].upper() + text[1:])
         else:
             self.insight.configure(text="Patterns appear once you have at least two sessions in two or more "
@@ -2200,6 +2722,7 @@ class App:
             if r["id"] in ids:
                 self.store.delete(r)
         self.reload_sessions()
+        self.auto_export()
         if self.last_result is not None and self.last_result["id"] in ids:
             self.last_result = None
             self.result_card.pack_forget()
@@ -2207,22 +2730,53 @@ class App:
                 self.show_results(self.sessions[-1], fresh=False)
 
     def export_csv(self):
-        path = filedialog.asksaveasfilename(parent=self.root, title="Export sessions", defaultextension=".csv",
-                                            initialfile="focus-trainer-sessions.csv",
-                                            filetypes=[("CSV file", "*.csv"), ("All files", "*.*")])
-        if not path:
+        ids = set(self.tree.selection())
+        recs = [r for r in self.sessions if r["id"] in ids] if ids else list(self.sessions)
+        if not recs:
+            messagebox.showinfo(APP_NAME, "There are no sessions to export yet.", parent=self.root)
             return
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["start", "end", "planned_minutes", "active_minutes", "completed", "distractions",
-                        "per_10_min", "longest_focus_seconds", "pauses", "computer", "distraction_times_seconds"])
-            for r in self.sessions:
-                m = r["_m"]
-                w.writerow([r["start"], r.get("end", ""), round(r.get("planned_seconds", 0) / 60, 1),
-                            round(m["seconds"] / 60, 1), r.get("completed", False), m["count"], round(m["rate"], 2),
-                            round(m["longest"]), r.get("pause_count", 0), r.get("machine", ""),
-                            " ".join(f"{t:g}" for t in m["times"])])
-        messagebox.showinfo(APP_NAME, f"Exported {plural(len(self.sessions), 'session')} to\n{path}", parent=self.root)
+        folder = filedialog.askdirectory(parent=self.root, title="Choose a folder for the CSV files",
+                                         initialdir=os.path.expanduser("~"))
+        if not folder:
+            return
+        prefix = "focus-trainer-"
+        targets = [os.path.join(folder, f"{prefix}{n}.csv") for n in ("sessions", "events")]
+        existing = [os.path.basename(t) for t in targets if os.path.exists(t)]
+        if existing and not messagebox.askyesno(
+                APP_NAME, f"{' and '.join(existing)} already exist{'s' if len(existing) == 1 else ''} in that "
+                          "folder.\n\nReplace them?", parent=self.root):
+            return
+        try:
+            paths = export_csvs(recs, folder, prefix)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"Couldn't write the CSV files:\n{exc}\n\n"
+                                           "If one is open in Excel, close it and try again.", parent=self.root)
+            return
+        which = f"the {plural(len(recs), 'selected session')}" if ids else f"all {plural(len(recs), 'session')}"
+        messagebox.showinfo(APP_NAME, f"Exported {which} to:\n\n" + "\n".join(paths), parent=self.root)
+
+    def csv_folder(self):
+        return os.path.join(self.data_folder(), "csv")
+
+    def auto_export(self):
+        """Keep csv/sessions.csv and csv/events.csv in the history folder up to date."""
+        if not self.settings["auto_csv"]:
+            note = "CSV files aren't being kept up to date. Use Export CSV… on the History tab when you need them."
+        elif not self.sessions:
+            note = f"CSV files will appear in {self.csv_folder()} after your first session."
+        else:
+            try:
+                export_csvs(self.sessions, self.csv_folder(), only_if_changed=True)
+                note = f"sessions.csv and events.csv in {self.csv_folder()} include all {len(self.sessions)} sessions."
+            except OSError as exc:
+                note = (f"Couldn't update the CSV files ({exc.strerror or exc}). If one is open in Excel, "
+                        "they'll be updated after your next session.")
+        self.csv_note = note
+        self.csv_status.configure(text=note)
+
+    def _toggle_auto_csv(self):
+        self.settings["auto_csv"] = bool(self.auto_csv_var.get())
+        self.auto_export()
 
     # -- settings actions ----------------------------------------------------------
     def test_feedback(self):
@@ -2262,7 +2816,7 @@ class App:
         try:
             mods, key = parse_combo(self.hotkey_var.get())
         except ValueError as exc:
-            self._hotkey_msg(str(exc), BAD)
+            self._hotkey_msg(str(exc), "bad")
             return
         combo = format_combo(mods, key)
         self.hotkey_var.set(combo)
@@ -2278,38 +2832,39 @@ class App:
             return
         self.hotkeys.record()
         self.record_btn.configure(text="Press keys…", state="disabled")
-        self._hotkey_msg("Press the new shortcut now (Esc cancels).", INK_2)
+        self._hotkey_msg("Press the new shortcut now (Esc cancels).", "ink2")
 
-    def _hotkey_msg(self, text, color):
-        self.hotkey_status.configure(text=text, foreground=color)
+    def _hotkey_msg(self, text, role):
+        self.hotkey_status_role = (text, role)
+        self.hotkey_status.configure(text=text, foreground=getattr(C, role))
 
     def apply_hotkey(self):
         self.hotkeys.target = None
         if not self.settings["hotkey_enabled"]:
             self.hotkeys.stop()
-            self._hotkey_msg("Keyboard shortcut is off.", MUTED)
+            self._hotkey_msg("Keyboard shortcut is off.", "muted")
         elif not self.hotkeys.available:
             install = "py -m pip install pynput" if IS_WINDOWS else "sudo apt install python3-pynput"
             self._hotkey_msg(f"The shortcut needs the pynput package. Install it with:   {install}\n"
-                             f"then restart {APP_NAME}.  ({self.hotkeys.error})", BAD)
+                             f"then restart {APP_NAME}.  ({self.hotkeys.error})", "bad")
         else:
             try:
                 mods, key = parse_combo(self.settings["hotkey"])
                 self.hotkeys.start(mods, key)
             except ValueError as exc:
                 self.hotkeys.stop()
-                self._hotkey_msg(f"{exc}", BAD)
+                self._hotkey_msg(f"{exc}", "bad")
             except Exception as exc:
                 self.hotkeys.stop()
-                self._hotkey_msg(f"Couldn't start the keyboard listener: {exc}", BAD)
+                self._hotkey_msg(f"Couldn't start the keyboard listener: {exc}", "bad")
             else:
                 msg = f"On: press {format_combo(mods, key)} in any app to log a distraction."
-                color = GOOD
+                color = "good"
                 if not IS_WINDOWS and is_wayland():
                     msg += ("\nYou're in a Wayland session, where apps can't see shortcuts typed into other apps. "
                             "Use the system-shortcut command below,\nor choose the X11 session "
                             "(the gear icon on the login screen).")
-                    color = INK_2
+                    color = "ink2"
                 self._hotkey_msg(msg, color)
         self._update_hint()
 
@@ -2340,8 +2895,148 @@ class App:
         self.settings["data_folder"] = new
         self._show_folder()
         self.reload_sessions()
+        self.auto_export()
         if self.sessions and self.session is None:
             self.show_results(self.sessions[-1], fresh=False)
+
+    # -- updates ---------------------------------------------------------------------
+    def _update_msg(self, text, role="muted"):
+        self.update_status_role = (text, role)
+        self.update_status.configure(text=text, foreground=getattr(C, role))
+
+    def check_updates(self, manual=False):
+        if self.update_checking:
+            return
+        self.update_checking = True
+        if manual:
+            self._update_msg("Checking for updates…", "ink2")
+
+        def work():
+            try:
+                self.q.put(("update_checked", (manual, fetch_manifest(), None)))
+            except Exception as exc:  # network errors, bad data
+                self.q.put(("update_checked", (manual, None, str(exc))))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_checked(self, manual, man, error):
+        self.update_checking = False
+        if error:
+            self._update_msg(f"Couldn't check for updates. {error}", "bad" if manual else "muted")
+            return
+        if version_tuple(man["version"]) <= version_tuple(APP_VERSION):
+            self._update_msg(f"You have the latest version ({APP_VERSION}).", "good" if manual else "muted")
+            return
+        self._update_msg(f"Version {man['version']} is available.", "ink2")
+        if not manual and man["version"] == self.settings["skipped_version"]:
+            return
+        self.pending_update = man
+        if self.session is None:
+            self.show_update_dialog(man)
+
+    def show_update_dialog(self, man):
+        if self.session is not None or getattr(self, "update_dialog", None) is not None:
+            return
+        p = self.px
+        self.show_main()
+        dlg = self.update_dialog = tk.Toplevel(self.root, bg=C.page)
+        dlg.title("Update available")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=(p(24), p(20), p(24), p(18)))
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=f"{APP_NAME} {man['version']} is available", style="H2.TLabel").pack(anchor="w")
+        ttk.Label(body, text=f"You have version {APP_VERSION}.", style="Sub.TLabel").pack(anchor="w", pady=(p(2), p(12)))
+        if man["notes"]:
+            ttk.Label(body, text="What's new", style="H3.TLabel").pack(anchor="w")
+            for note in man["notes"][:12]:
+                ttk.Label(body, text=f"•  {note}", wraplength=p(460), justify="left").pack(anchor="w", pady=(p(2), 0))
+        how = ("This copy is a Git clone, so the update runs 'git pull'." if is_git_checkout() else
+               "Your current version is backed up first. Your sessions and settings aren't touched.")
+        ttk.Label(body, text=how, style="Muted.TLabel", wraplength=p(460), justify="left").pack(anchor="w", pady=(p(14), 0))
+        status = ttk.Label(body, style="Sub.TLabel", wraplength=p(460), justify="left")
+        status.pack(anchor="w", pady=(p(8), 0))
+        btns = ttk.Frame(body)
+        btns.pack(fill="x", pady=(p(14), 0))
+        install = ttk.Button(btns, text="Install and restart", style="Accent.TButton")
+        later = ttk.Button(btns, text="Later")
+        skip = ttk.Button(btns, text="Skip this version")
+        install.pack(side="left")
+        later.pack(side="left", padx=(p(8), 0))
+        skip.pack(side="right")
+
+        def close():
+            self.update_dialog = None
+            dlg.destroy()
+
+        def do_skip():
+            self.settings["skipped_version"] = man["version"]
+            self.pending_update = None
+            close()
+
+        def do_later():
+            self.pending_update = None
+            close()
+
+        def do_install():
+            for b in (install, later, skip):
+                b.configure(state="disabled")
+            dlg.protocol("WM_DELETE_WINDOW", lambda: None)
+            status.configure(text="Downloading and installing…", foreground=C.ink2)
+
+            def work():
+                try:
+                    self.q.put(("update_installed", (man, install_update(man), None)))
+                except Exception as exc:
+                    self.q.put(("update_installed", (man, None, str(exc))))
+            threading.Thread(target=work, daemon=True).start()
+
+        def failed(error):
+            status.configure(text=f"The update wasn't installed. {error}", foreground=C.bad)
+            for b in (install, later, skip):
+                b.configure(state="normal")
+            dlg.protocol("WM_DELETE_WINDOW", do_later)
+
+        install.configure(command=do_install)
+        later.configure(command=do_later)
+        skip.configure(command=do_skip)
+        dlg.protocol("WM_DELETE_WINDOW", do_later)
+        self.update_failed = failed
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_reqwidth()) // 2
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - dlg.winfo_reqheight()) // 3)
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
+
+    def _on_update_installed(self, man, backup, error):
+        if error:
+            if getattr(self, "update_dialog", None) is not None:
+                self.update_failed(error)
+            return
+        self.settings["updated_from"] = APP_VERSION
+        self.settings["skipped_version"] = ""
+        self.restart_app()
+
+    def restart_app(self):
+        """Start the (updated) app in a new process and close this one."""
+        self.close_preview()
+        self.hotkeys.stop()
+        if self.ipc is not None:
+            self.ipc.close()  # free the port so the new copy can take over
+        kwargs = {"cwd": APP_DIR, "close_fds": True}
+        if IS_WINDOWS:
+            kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen([sys.executable, os.path.join(APP_DIR, "focus_trainer.py")], **kwargs)
+        self.root.destroy()
+
+    def _after_update_notice(self):
+        old = self.settings["updated_from"]
+        if old:
+            self.settings["updated_from"] = ""
+            self._update_msg(f"Updated from {old} to {APP_VERSION}.", "good")
+            messagebox.showinfo(APP_NAME, f"{APP_NAME} was updated from version {old} to {APP_VERSION}.",
+                                parent=self.root)
 
     # -- window / events --------------------------------------------------------------
     def show_main(self):
@@ -2363,6 +3058,10 @@ class App:
                     self.log_distraction(payload)
                 elif kind == "show":
                     self.show_main()
+                elif kind == "update_checked":
+                    self._on_update_checked(*payload)
+                elif kind == "update_installed":
+                    self._on_update_installed(*payload)
                 elif kind == "hotkey_recorded":
                     self.record_btn.configure(text="Record…", state="normal")
                     if not self.settings["hotkey_enabled"]:
@@ -2385,7 +3084,7 @@ class App:
             if ans is None:
                 return
             if ans:
-                self.finish_session(completed=False, confirm_short=False)
+                self.finish_session(completed=False, reason="quit", confirm_short=False)
             else:
                 self.session = None
                 self._clear_in_progress()

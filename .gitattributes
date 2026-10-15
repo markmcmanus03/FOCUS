@@ -1,4 +1,3 @@
-*.bat text eol=crlf
-*.sh text eol=lf
-*.py text eol=lf
+* text=auto eol=lf
+*.bat -text
 *.png binary
